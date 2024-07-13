@@ -65,40 +65,22 @@ function M.attach(bufnr)
   ---@type {[string]: nil|integer}
   local xmids = { jump = nil, insert = nil, change = nil }
 
-  do --jump, ''
-    local pos = {} ---@type [integer,integer]
-    aug:repeats("CursorMoved", {
-      callback = function()
-        local lnum, col = get_bufmark(bufnr, "'")
-        if not (lnum and col) then return xmarks:del(xmids.jump) end
+  do
+    ---@param key 'jump'|'insert'|'change'
+    ---@param mark "^"|"."|string
+    local function oncall(key, mark, emoji)
+      local pos = {} ---@type [integer,integer]
+      return function()
+        local lnum, col = get_bufmark(bufnr, mark)
+        if not (lnum and col) then return xmarks:del(xmids[key]) end
         if pos[1] == lnum and pos[2] == col then return end
-        xmids.jump = xmarks:upsert(xmids.jump, lnum, col, "🐰")
-      end,
-    })
-  end
+        xmids[key] = xmarks:upsert(xmids[key], lnum, col, emoji)
+      end
+    end
 
-  do --insert, '^
-    local pos = {} ---@type [integer,integer]
-    aug:repeats("InsertLeave", {
-      callback = function()
-        local lnum, col = get_bufmark(bufnr, "^")
-        if not (lnum and col) then return xmarks:del(xmids.insert) end
-        if pos[1] == lnum and pos[2] == col then return end
-        xmids.insert = xmarks:upsert(xmids.insert, lnum, col, "🐭")
-      end,
-    })
-  end
-
-  do --change, '.
-    local pos = {} ---@type [integer,integer]
-    aug:repeats("TextChanged", {
-      callback = function()
-        local lnum, col = get_bufmark(bufnr, ".")
-        if not (lnum and col) then return xmarks:del(xmids.change) end
-        if pos[1] == lnum and pos[2] == col then return end
-        xmids.change = xmarks:upsert(xmids.change, lnum, col, "🐱")
-      end,
-    })
+    aug:repeats("CursorMoved", { callback = oncall("jump", "'", "🐰") })
+    aug:repeats("InsertLeave", { callback = oncall("insert", "^", "🐭") })
+    aug:repeats("TextChanged", { callback = oncall("change", ".", "🐱") })
   end
 
   state[bufnr] = function()
