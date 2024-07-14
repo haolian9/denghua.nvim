@@ -2,6 +2,7 @@ local M = {}
 
 local augroups = require("infra.augroups")
 local highlighter = require("infra.highlighter")
+local jelly = require("infra.jellyfish")("denghua", "debug")
 local ni = require("infra.ni")
 
 ---@param bufnr integer
@@ -58,6 +59,8 @@ local state = {}
 ---@param bufnr? integer
 function M.attach(bufnr)
   bufnr = bufnr or ni.get_current_buf()
+
+  if state[bufnr] ~= nil then return jelly.debug("attached already") end
 
   local aug = augroups.BufAugroup(bufnr, "denghua", true)
   local xmarks = Xmarks(bufnr)
