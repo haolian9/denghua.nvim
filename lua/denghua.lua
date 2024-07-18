@@ -41,12 +41,29 @@ do
     ni.buf_del_extmark(self.bufnr, ns, xmid)
   end
 
+  ---@param xmid integer
+  ---@param lnum integer
+  ---@param col integer
+  ---@param emoji string
+  ---@return integer xmid
   function Impl:upsert(xmid, lnum, col, emoji)
-    return ni.buf_set_extmark(self.bufnr, ns, lnum, col, {
+    local ok1, err1 = pcall(ni.buf_set_extmark, self.bufnr, ns, lnum, col, {
       id = xmid,
       virt_text = { { emoji, "Denghua" } },
       virt_text_pos = "inline",
     })
+    if ok1 then return err1 end
+
+    --(n)vim can offer illegal mark pos during undo/redo; if shit happens, try col=-1
+    local ok2, err2 = pcall(ni.buf_set_extmark, self.bufnr, ns, lnum, -1, {
+      id = xmid,
+      virt_text = { { emoji, "Denghua" } },
+      virt_text_pos = "inline",
+    })
+    if ok2 then return err2 end
+
+    log.err("setxmark xm(%s, %s) (%s, %s) err1=%s; err2=%s", xmid, emoji, lnum, col, err1, err2)
+    error("unreachable")
   end
 
   ---@param bufnr integer
@@ -88,18 +105,30 @@ function M.attach()
         ---@param key 'jump'|'insert'|'change'
         ---@param mark "^"|"."|string
         local function oncall(key, mark, emoji)
-          local pos = {} ---@type [integer,integer]
           return function()
             local lnum, col = get_bufmark(bufnr, mark)
             log.debug("buf#%s mark=%s (%s, %s)", bufnr, mark, lnum, col)
-            if not (lnum and col) then return xmarks:del(xmids[key]) end
-            if pos[1] == lnum and pos[2] == col then return end
-            xmids[key] = xmarks:upsert(xmids[key], lnum, col, emoji)
+            if not (lnum and col) then
+              xmarks:del(xmids[key])
+              xmids[key] = nil
+            else
+              --should always update in realtime
+              xmids[key] = xmarks:upsert(xmids[key], lnum, col, emoji)
+            end
           end
         end
-        executor:repeats("CursorMoved", { callback = oncall("jump", "'", "") })
-        executor:repeats("InsertLeave", { callback = oncall("insert", "^", "") })
-        executor:repeats("TextChanged", { callback = oncall("change", ".", "") })
+        local mark_jump = oncall("jump", "'", "")
+        local mark_insert = oncall("insert", "^", "")
+        local mark_change = oncall("change", ".", "")
+        executor:repeats("CursorMoved", { callback = mark_jump })
+        executor:repeats("InsertLeave", { callback = mark_insert })
+        executor:repeats("TextChanged", {
+          callback = function()
+            mark_change()
+            mark_jump()
+            mark_insert()
+          end,
+        })
       end
 
       do
