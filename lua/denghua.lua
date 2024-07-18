@@ -2,8 +2,10 @@ local M = {}
 
 local augroups = require("infra.augroups")
 local highlighter = require("infra.highlighter")
-local jelly = require("infra.jellyfish")("denghua", "debug")
+local logging = require("infra.logging")
 local ni = require("infra.ni")
+
+local log = logging.newlogger("denghua", "info")
 
 ---@param bufnr integer
 ---@param mark "^"|"."|string
@@ -52,55 +54,92 @@ do
   function Xmarks(bufnr) return setmetatable({ bufnr = bufnr }, Impl) end
 end
 
----{bufnr: detach}
----@type {[integer]: fun()}
-local state = {}
+local arbiter ---@type infra.Augroup?
+local stop_arbiter ---@type fun()|nil
+local executor ---@type infra.BufAugroup?
+local stop_executor ---@type fun()|nil
 
----@param bufnr? integer
-function M.attach(bufnr)
-  bufnr = bufnr or ni.get_current_buf()
+function M.attach()
+  if arbiter ~= nil then return end
+  arbiter = augroups.Augroup("denghua://")
 
-  if state[bufnr] ~= nil then return jelly.debug("attached already") end
-
-  local aug = augroups.BufAugroup(bufnr, "denghua", true)
-  local xmarks = Xmarks(bufnr)
-
-  ---@type {[string]: nil|integer}
-  local xmids = { jump = nil, insert = nil, change = nil }
-
-  do
-    ---@param key 'jump'|'insert'|'change'
-    ---@param mark "^"|"."|string
-    local function oncall(key, mark, emoji)
-      local pos = {} ---@type [integer,integer]
-      return function()
-        local lnum, col = get_bufmark(bufnr, mark)
-        if not (lnum and col) then return xmarks:del(xmids[key]) end
-        if pos[1] == lnum and pos[2] == col then return end
-        xmids[key] = xmarks:upsert(xmids[key], lnum, col, emoji)
-      end
-    end
-
-    aug:repeats("CursorMoved", { callback = oncall("jump", "'", "🐰") })
-    aug:repeats("InsertLeave", { callback = oncall("insert", "^", "🐭") })
-    aug:repeats("TextChanged", { callback = oncall("change", ".", "🐱") })
+  stop_arbiter = function()
+    local arb
+    arb, arbiter, stop_arbiter = arbiter, nil, nil
+    arb:unlink()
   end
 
-  state[bufnr] = function()
-    if not ni.buf_is_valid(bufnr) then return end
-    aug:unlink()
-    for _, xmid in pairs(xmids) do
-      xmarks:del(xmid)
-    end
+  arbiter:repeats({ "WinEnter", "BufWinEnter" }, {
+    callback = function()
+      local winid = ni.get_current_win()
+      local bufnr = ni.win_get_buf(winid)
+
+      if executor then
+        if executor.bufnr == bufnr then return end
+        assert(stop_executor)()
+      end
+
+      executor = augroups.BufAugroup(bufnr, "denghua", false)
+      local xmarks = Xmarks(bufnr)
+      ---@type {[string]: nil|integer}
+      local xmids = { jump = nil, insert = nil, change = nil }
+
+      do
+        ---@param key 'jump'|'insert'|'change'
+        ---@param mark "^"|"."|string
+        local function oncall(key, mark, emoji)
+          local pos = {} ---@type [integer,integer]
+          return function()
+            local lnum, col = get_bufmark(bufnr, mark)
+            log.debug("buf#%s mark=%s (%s, %s)", bufnr, mark, lnum, col)
+            if not (lnum and col) then return xmarks:del(xmids[key]) end
+            if pos[1] == lnum and pos[2] == col then return end
+            xmids[key] = xmarks:upsert(xmids[key], lnum, col, emoji)
+          end
+        end
+        executor:repeats("CursorMoved", { callback = oncall("jump", "'", "") })
+        executor:repeats("InsertLeave", { callback = oncall("insert", "^", "") })
+        executor:repeats("TextChanged", { callback = oncall("change", ".", "") })
+      end
+
+      do
+        executor:emit("CursorMoved", {})
+        executor:emit("InsertLeave", {})
+        executor:emit("TextChanged", {})
+      end
+
+      stop_executor = function()
+        local exec
+        exec, executor, stop_executor = executor, nil, nil
+        exec:unlink()
+        if ni.buf_is_valid(bufnr) then
+          for _, xmid in pairs(xmids) do
+            xmarks:del(xmid)
+          end
+        end
+      end
+    end,
+  })
+
+  arbiter:emit("WinEnter", {})
+
+  do
+    assert(executor)
+    executor:emit("CursorMoved", {})
+    executor:emit("InsertLeave", {})
+    executor:emit("TextChanged", {})
   end
 end
 
-function M.detach(bufnr)
-  bufnr = bufnr or ni.get_current_buf()
+function M.detach()
+  if stop_arbiter == nil then
+    assert(stop_executor == nil)
+    return
+  end
+  stop_arbiter()
 
-  local detach = state[bufnr]
-  if detach == nil then return end
-  detach()
+  if stop_executor == nil then return end
+  stop_executor()
 end
 
 return M
