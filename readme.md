@@ -1,5 +1,8 @@
 it shows `^ ' .` marks of a buffer with inline extmarks during editing
 
+https://github.com/user-attachments/assets/114490f9-6b05-497c-98e3-352dfaf4a576
+
+
 ## design choices, features, limits
 * show buf-local marks: `^` last insert, `'` last jump, `.` last change
 * only show them for the current/focused window/buffer at the same time
