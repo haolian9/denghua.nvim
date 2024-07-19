@@ -1,14 +1,15 @@
-it shows `^ ' .` marks of a buffer with inline extmarks during editing
+it shows `^ ' .` marks as inline extmarks while editing
 
 https://github.com/user-attachments/assets/114490f9-6b05-497c-98e3-352dfaf4a576
 
 
 ## design choices, features, limits
-* show buf-local marks: `^` last insert, `'` last jump, `.` last change
-* only show them for the current/focused window/buffer at the same time
+* show win-local marks: `'` last jump
+* show buf-local marks: `^` last insert, `.` last change
+* only show them in the current/focused window/buffer at the same time
 
 ## status
-* just works
+* WIP: it's harder than i thought
 
 ## todo
 * [ ] `g;`, `g,`
@@ -23,7 +24,7 @@ my personal config
 do --denghua
   do --:Denghua
     local spell = cmds.Spell("Denghua", function(args) assert(require("denghua")[args.op])(ni.get_current_buf()) end)
-    spell:add_arg("op", "string", false, "attach", cmds.ArgComp.constant({ "attach", "detach" }))
+    spell:add_arg("op", "string", false, "activate", cmds.ArgComp.constant({ "activate", "deactivate" }))
     cmds.cast(spell)
   end
 
