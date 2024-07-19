@@ -2,6 +2,7 @@ local M = {}
 
 local augroups = require("infra.augroups")
 local buflines = require("infra.buflines")
+local ctx = require("infra.ctx")
 local highlighter = require("infra.highlighter")
 local jelly = require("infra.jellyfish")("denghua", "debug")
 local logging = require("infra.logging")
@@ -26,65 +27,83 @@ do
     end
     facts.higroup = group
   end
-end
 
-local contracts = {}
-do
-  ---@class denghua.Caps
-  ---@field jump boolean
-  ---@field insert boolean
-  ---@field change boolean
+  do
+    ---@class denghua.Caps
+    ---@field jump boolean
+    ---@field insert boolean
+    ---@field change boolean
 
-  local function no_caps() return { jump = false, insert = false, change = false } end
+    local function no_caps() return { jump = false, insert = false, change = false } end
 
-  ---@param winid integer
-  ---@return denghua.Caps
-  function contracts.resolve_caps(winid) --
-    local bufnr = ni.win_get_buf(winid)
+    ---@param winid integer
+    ---@return denghua.Caps
+    function facts.Caps(winid) --
+      local bufnr = ni.win_get_buf(winid)
 
-    local bo = prefer.buf(bufnr)
-    if bo.buftype == "terminal" then return no_caps() end
-    if bo.buftype == "quickfix" then return no_caps() end
-    if bo.buftype == "prompt" then return no_caps() end
+      local bo = prefer.buf(bufnr)
+      if bo.buftype == "terminal" then return no_caps() end
+      if bo.buftype == "quickfix" then return no_caps() end
+      if bo.buftype == "prompt" then return no_caps() end
 
-    local caps = { jump = true, insert = true, change = true }
+      local caps = { jump = true, insert = true, change = true }
 
-    if bo.readonly then
-      caps.insert = false
-      caps.change = false
+      if bo.readonly then
+        caps.insert = false
+        caps.change = false
+      end
+
+      if bo.undolevels == -1 then caps.change = false end
+
+      --todo: more constraints
+
+      return caps
     end
-
-    if bo.undolevels == -1 then caps.change = false end
-
-    --todo: more constraints
-
-    return caps
   end
 end
 
----@param bufnr integer
----@param mark "^"|"."|string
----@return integer? lnum @0-based
----@return integer? col @0-based
-local function get_bufmark(bufnr, mark)
-  local row, col = unpack(ni.buf_get_mark(bufnr, mark))
-  if row == 0 then return end
-  return row - 1, col
-end
-
-local Xmarks
+local localmarks = {}
 do
-  ---@class denghua.Xmarks
-  ---@field bufnr integer
-  local Impl = {}
-  Impl.__index = Impl
-
-  ---@param xmid? integer
-  function Impl:del(xmid)
-    if xmid == nil then return end
-    ni.buf_del_extmark(self.bufnr, facts.xmark_ns, xmid)
+  ---@param bufnr integer
+  ---@param mark "^"|"."|string
+  ---@return integer? lnum @0-based
+  ---@return integer? col @0-based
+  local function get_buf_mark(bufnr, mark)
+    local row, col = unpack(ni.buf_get_mark(bufnr, mark))
+    if row == 0 then return end
+    return row - 1, col
   end
 
+  ---@return integer? lnum @0-based
+  ---@return integer? col @0-based
+  function localmarks.insert(bufnr) return get_buf_mark(bufnr, "^") end
+
+  ---@return integer? lnum @0-based
+  ---@return integer? col @0-based
+  function localmarks.change(bufnr) return get_buf_mark(bufnr, ".") end
+
+  ---@return integer? lnum @0-based
+  ---@return integer? col @0-based
+  function localmarks.jump(winid, bufnr)
+    --todo: noautocmd?
+
+    --according to the impl, nvim_buf_get_mark always get this mark based on curwin, curbuf
+    return ctx.win(winid, function()
+      return ctx.buf(bufnr, function() return get_buf_mark(bufnr, "'") end)
+    end)
+  end
+end
+
+local xmarks = {}
+do
+  ---@param bufnr integer
+  ---@param xmid? integer
+  function xmarks.del(bufnr, xmid)
+    if xmid == nil then return end
+    ni.buf_del_extmark(bufnr, facts.xmark_ns, xmid)
+  end
+
+  ---@param bufnr integer
   ---@param xmid integer
   ---@param lnum integer
   ---@param col integer
@@ -92,7 +111,7 @@ do
   ---@return integer? xmid
   ---@return integer? lnum
   ---@return integer? col
-  function Impl:upsert(xmid, lnum, col, icon)
+  function xmarks.upsert(bufnr, xmid, lnum, col, icon)
     local opts = { id = xmid, virt_text = { { icon, facts.higroup } }, virt_text_pos = "inline" }
 
     ---notes:
@@ -102,21 +121,17 @@ do
     ---* if the position of a mark is invalid: if lnum exists, try EOL; if not, do nothing
 
     do --check
-      if lnum > buflines.high(self.bufnr) then return jelly.debug("lnum out of range") end
+      if lnum > buflines.high(bufnr) then return jelly.debug("lnum out of range") end
 
-      local llen = assert(unsafe.linelen(self.bufnr, lnum))
+      local llen = assert(unsafe.linelen(bufnr, lnum))
       local high = llen - 1
       if col > high then col = high end
     end
 
-    local new_xmid = ni.buf_set_extmark(self.bufnr, facts.xmark_ns, lnum, col, opts)
+    local new_xmid = ni.buf_set_extmark(bufnr, facts.xmark_ns, lnum, col, opts)
 
     return new_xmid, lnum, col
   end
-
-  ---@param bufnr integer
-  ---@return denghua.Xmarks
-  function Xmarks(bufnr) return setmetatable({ bufnr = bufnr }, Impl) end
 end
 
 local arbiter ---@type infra.Augroup?
@@ -133,11 +148,10 @@ local function on_winenter()
     assert(stop_executor)()
   end
 
-  local caps = contracts.resolve_caps(winid)
+  local caps = facts.Caps(winid)
   if not (caps.jump or caps.insert or caps.change) then return end
 
   executor = augroups.BufAugroup(bufnr, "denghua", false)
-  local xmarks = Xmarks(bufnr)
   ---@type {[string]: nil|integer}
   local xmids = { jump = nil, insert = nil, change = nil }
 
@@ -147,38 +161,38 @@ local function on_winenter()
     exec:unlink()
     if ni.buf_is_valid(bufnr) then
       for _, xmid in pairs(xmids) do
-        xmarks:del(xmid)
+        xmarks.del(bufnr, xmid)
       end
     end
   end
 
   do --the update mechanism
     local function del_from_xmids(key)
-      xmarks:del(xmids[key])
+      xmarks.del(bufnr, xmids[key])
       xmids[key] = nil
     end
 
     ---@param key 'jump'|'insert'|'change'
-    ---@param mark "^"|"."|string
-    local function markUpdator(key, mark)
+    ---@param mark_pos fun():(lnum:integer?,col:integer?)
+    local function markUpdator(key, mark_pos)
       local icon = assert(facts.icons[key])
       local last_lnum, last_col
       return function()
-        local lnum, col = get_bufmark(bufnr, mark)
-        log.debug("buf#%s mark=%s (%s, %s)", bufnr, mark, lnum, col)
+        local lnum, col = mark_pos()
+        log.debug("buf#%s key=%s (%s, %s)", bufnr, key, lnum, col)
         if not (lnum and col) then return del_from_xmids(key) end
         if lnum == last_lnum and col == last_col then return end
 
-        local xmid, added_lnum, added_col = xmarks:upsert(xmids[key], lnum, col, icon)
+        local xmid, added_lnum, added_col = xmarks.upsert(bufnr, xmids[key], lnum, col, icon)
         if not (xmid and added_lnum and added_col) then return del_from_xmids(key) end
 
         xmids[key], last_lnum, last_col = xmid, added_lnum, added_col
       end
     end
 
-    local mark_jump = markUpdator("jump", "'")
-    local mark_insert = markUpdator("insert", "^")
-    local mark_change = markUpdator("change", ".")
+    local mark_jump = markUpdator("jump", function() return localmarks.jump(winid, bufnr) end)
+    local mark_insert = markUpdator("insert", function() return localmarks.insert(bufnr) end)
+    local mark_change = markUpdator("change", function() return localmarks.change(bufnr) end)
 
     if caps.jump then executor:repeats("CursorMoved", { callback = mark_jump }) end
     if caps.insert then executor:repeats("InsertLeave", { callback = mark_insert }) end
