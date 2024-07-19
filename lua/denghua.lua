@@ -1,11 +1,66 @@
 local M = {}
 
 local augroups = require("infra.augroups")
+local buflines = require("infra.buflines")
 local highlighter = require("infra.highlighter")
+local jelly = require("infra.jellyfish")("denghua", "debug")
 local logging = require("infra.logging")
 local ni = require("infra.ni")
+local prefer = require("infra.prefer")
+local unsafe = require("infra.unsafe")
 
-local log = logging.newlogger("denghua", "info")
+local log = logging.newlogger("denghua", "debug")
+
+local facts = {}
+do
+  facts.icons = { jump = "", insert = "", change = "" }
+  facts.xmark_ns = ni.create_namespace("denghua.xmarks")
+
+  do
+    local group = "Denghua"
+    local hi = highlighter(0)
+    if vim.go.background == "light" then
+      hi(group, { fg = 1 })
+    else
+      hi(group, { fg = 9 })
+    end
+    facts.higroup = group
+  end
+end
+
+local contracts = {}
+do
+  ---@class denghua.Caps
+  ---@field jump boolean
+  ---@field insert boolean
+  ---@field change boolean
+
+  local function no_caps() return { jump = false, insert = false, change = false } end
+
+  ---@param winid integer
+  ---@return denghua.Caps
+  function contracts.resolve_caps(winid) --
+    local bufnr = ni.win_get_buf(winid)
+
+    local bo = prefer.buf(bufnr)
+    if bo.buftype == "terminal" then return no_caps() end
+    if bo.buftype == "quickfix" then return no_caps() end
+    if bo.buftype == "prompt" then return no_caps() end
+
+    local caps = { jump = true, insert = true, change = true }
+
+    if bo.readonly then
+      caps.insert = false
+      caps.change = false
+    end
+
+    if bo.undolevels == -1 then caps.change = false end
+
+    --todo: more constraints
+
+    return caps
+  end
+end
 
 ---@param bufnr integer
 ---@param mark "^"|"."|string
@@ -19,17 +74,6 @@ end
 
 local Xmarks
 do
-  local ns = ni.create_namespace("denghua.xmarks")
-
-  do
-    local hi = highlighter(0)
-    if vim.go.background == "light" then
-      hi("Denghua", { fg = 1 })
-    else
-      hi("Denghua", { fg = 9 })
-    end
-  end
-
   ---@class denghua.Xmarks
   ---@field bufnr integer
   local Impl = {}
@@ -38,32 +82,36 @@ do
   ---@param xmid? integer
   function Impl:del(xmid)
     if xmid == nil then return end
-    ni.buf_del_extmark(self.bufnr, ns, xmid)
+    ni.buf_del_extmark(self.bufnr, facts.xmark_ns, xmid)
   end
 
   ---@param xmid integer
   ---@param lnum integer
   ---@param col integer
-  ---@param emoji string
-  ---@return integer xmid
-  function Impl:upsert(xmid, lnum, col, emoji)
-    local ok1, err1 = pcall(ni.buf_set_extmark, self.bufnr, ns, lnum, col, {
-      id = xmid,
-      virt_text = { { emoji, "Denghua" } },
-      virt_text_pos = "inline",
-    })
-    if ok1 then return err1 end
+  ---@param icon string
+  ---@return integer? xmid
+  ---@return integer? lnum
+  ---@return integer? col
+  function Impl:upsert(xmid, lnum, col, icon)
+    local opts = { id = xmid, virt_text = { { icon, facts.higroup } }, virt_text_pos = "inline" }
 
-    --(n)vim can offer illegal mark pos during undo/redo; if shit happens, try col=-1
-    local ok2, err2 = pcall(ni.buf_set_extmark, self.bufnr, ns, lnum, -1, {
-      id = xmid,
-      virt_text = { { emoji, "Denghua" } },
-      virt_text_pos = "inline",
-    })
-    if ok2 then return err2 end
+    ---notes:
+    ---* 'mark is window-local, not buffer-local
+    ---* ^mark and .mark are buffer-local
+    ---* marks can be invalid
+    ---* if the position of a mark is invalid: if lnum exists, try EOL; if not, do nothing
 
-    log.err("setxmark xm(%s, %s) (%s, %s) err1=%s; err2=%s", xmid, emoji, lnum, col, err1, err2)
-    error("unreachable")
+    do --check
+      if lnum > buflines.high(self.bufnr) then return jelly.debug("lnum out of range") end
+
+      local llen = assert(unsafe.linelen(self.bufnr, lnum))
+      local high = llen - 1
+      if col > high then col = high end
+    end
+
+    local new_xmid = ni.buf_set_extmark(self.bufnr, facts.xmark_ns, lnum, col, opts)
+
+    return new_xmid, lnum, col
   end
 
   ---@param bufnr integer
@@ -76,91 +124,102 @@ local stop_arbiter ---@type fun()|nil
 local executor ---@type infra.BufAugroup?
 local stop_executor ---@type fun()|nil
 
-function M.attach()
+local function on_winenter()
+  local winid = ni.get_current_win()
+  local bufnr = ni.win_get_buf(winid)
+
+  if executor then
+    if executor.bufnr == bufnr then return end
+    assert(stop_executor)()
+  end
+
+  local caps = contracts.resolve_caps(winid)
+  if not (caps.jump or caps.insert or caps.change) then return end
+
+  executor = augroups.BufAugroup(bufnr, "denghua", false)
+  local xmarks = Xmarks(bufnr)
+  ---@type {[string]: nil|integer}
+  local xmids = { jump = nil, insert = nil, change = nil }
+
+  stop_executor = function()
+    local exec = executor
+    executor, stop_executor = nil, nil
+    exec:unlink()
+    if ni.buf_is_valid(bufnr) then
+      for _, xmid in pairs(xmids) do
+        xmarks:del(xmid)
+      end
+    end
+  end
+
+  do --the update mechanism
+    local function del_from_xmids(key)
+      xmarks:del(xmids[key])
+      xmids[key] = nil
+    end
+
+    ---@param key 'jump'|'insert'|'change'
+    ---@param mark "^"|"."|string
+    local function markUpdator(key, mark)
+      local icon = assert(facts.icons[key])
+      local last_lnum, last_col
+      return function()
+        local lnum, col = get_bufmark(bufnr, mark)
+        log.debug("buf#%s mark=%s (%s, %s)", bufnr, mark, lnum, col)
+        if not (lnum and col) then return del_from_xmids(key) end
+        if lnum == last_lnum and col == last_col then return end
+
+        local xmid, added_lnum, added_col = xmarks:upsert(xmids[key], lnum, col, icon)
+        if not (xmid and added_lnum and added_col) then return del_from_xmids(key) end
+
+        xmids[key], last_lnum, last_col = xmid, added_lnum, added_col
+      end
+    end
+
+    local mark_jump = markUpdator("jump", "'")
+    local mark_insert = markUpdator("insert", "^")
+    local mark_change = markUpdator("change", ".")
+
+    if caps.jump then executor:repeats("CursorMoved", { callback = mark_jump }) end
+    if caps.insert then executor:repeats("InsertLeave", { callback = mark_insert }) end
+    if caps.change then --
+      executor:repeats("TextChanged", {
+        callback = function()
+          mark_change()
+          if caps.jump then mark_jump() end
+          if caps.insert then mark_insert() end
+        end,
+      })
+    end
+  end
+
+  do --trigger the first update
+    if caps.jump then executor:emit("CursorMoved", {}) end
+    if caps.insert then executor:emit("InsertLeave", {}) end
+    if caps.change then executor:emit("TextChanged", {}) end
+  end
+end
+
+function M.activate()
   if arbiter ~= nil then return end
   arbiter = augroups.Augroup("denghua://")
 
   stop_arbiter = function()
-    local arb
-    arb, arbiter, stop_arbiter = arbiter, nil, nil
+    local arb = arbiter
+    arbiter, stop_arbiter = nil, nil
     arb:unlink()
   end
 
   arbiter:repeats({ "WinEnter", "BufWinEnter" }, {
-    callback = function()
-      local winid = ni.get_current_win()
-      local bufnr = ni.win_get_buf(winid)
-
-      if executor then
-        if executor.bufnr == bufnr then return end
-        assert(stop_executor)()
-      end
-
-      executor = augroups.BufAugroup(bufnr, "denghua", false)
-      local xmarks = Xmarks(bufnr)
-      ---@type {[string]: nil|integer}
-      local xmids = { jump = nil, insert = nil, change = nil }
-
-      do
-        ---@param key 'jump'|'insert'|'change'
-        ---@param mark "^"|"."|string
-        local function oncall(key, mark, emoji)
-          return function()
-            local lnum, col = get_bufmark(bufnr, mark)
-            log.debug("buf#%s mark=%s (%s, %s)", bufnr, mark, lnum, col)
-            if not (lnum and col) then
-              xmarks:del(xmids[key])
-              xmids[key] = nil
-            else
-              --should always update in realtime
-              xmids[key] = xmarks:upsert(xmids[key], lnum, col, emoji)
-            end
-          end
-        end
-        local mark_jump = oncall("jump", "'", "")
-        local mark_insert = oncall("insert", "^", "")
-        local mark_change = oncall("change", ".", "")
-        executor:repeats("CursorMoved", { callback = mark_jump })
-        executor:repeats("InsertLeave", { callback = mark_insert })
-        executor:repeats("TextChanged", {
-          callback = function()
-            mark_change()
-            mark_jump()
-            mark_insert()
-          end,
-        })
-      end
-
-      do
-        executor:emit("CursorMoved", {})
-        executor:emit("InsertLeave", {})
-        executor:emit("TextChanged", {})
-      end
-
-      stop_executor = function()
-        local exec
-        exec, executor, stop_executor = executor, nil, nil
-        exec:unlink()
-        if ni.buf_is_valid(bufnr) then
-          for _, xmid in pairs(xmids) do
-            xmarks:del(xmid)
-          end
-        end
-      end
-    end,
+    ---this vim.schedule is necessary here, due to: https://github.com/neovim/neovim/issues/24843
+    callback = vim.schedule_wrap(on_winenter),
   })
 
+  --triger the first run
   arbiter:emit("WinEnter", {})
-
-  do
-    assert(executor)
-    executor:emit("CursorMoved", {})
-    executor:emit("InsertLeave", {})
-    executor:emit("TextChanged", {})
-  end
 end
 
-function M.detach()
+function M.deactivate()
   if stop_arbiter == nil then
     assert(stop_executor == nil)
     return
