@@ -85,12 +85,19 @@ do
   ---@return integer? lnum @0-based
   ---@return integer? col @0-based
   function localmarks.jump(winid, bufnr)
-    --todo: noautocmd?
-
+    --todo: can be removed, per jump_of_curwin_curbuf
     --according to the impl, nvim_buf_get_mark always get this mark based on curwin, curbuf
     return ctx.win(winid, function()
       return ctx.buf(bufnr, function() return get_buf_mark(bufnr, "'") end)
     end)
+  end
+
+  ---@return integer? lnum @0-based
+  ---@return integer? col @0-based
+  function localmarks.jump_of_curwin_curbuf(winid, bufnr)
+    assert(ni.get_current_win() == winid, "curwin not matched")
+    assert(ni.get_current_buf() == bufnr, "curbuf not matched")
+    return get_buf_mark(bufnr, "'")
   end
 end
 
@@ -139,9 +146,11 @@ local stop_arbiter ---@type fun()|nil
 local executor ---@type infra.BufAugroup?
 local stop_executor ---@type fun()|nil
 
-local function on_winenter()
-  local winid = ni.get_current_win()
-  local bufnr = ni.win_get_buf(winid)
+---@param winid integer
+---@param bufnr integer
+local function main(winid, bufnr)
+  --todo: only set xmarks in the FOV
+  --todo: maybe nvim_set_decoration_provider
 
   if executor then
     if executor.bufnr == bufnr then return end
@@ -190,7 +199,7 @@ local function on_winenter()
       end
     end
 
-    local mark_jump = markUpdator("jump", function() return localmarks.jump(winid, bufnr) end)
+    local mark_jump = markUpdator("jump", function() return localmarks.jump_of_curwin_curbuf(winid, bufnr) end)
     local mark_insert = markUpdator("insert", function() return localmarks.insert(bufnr) end)
     local mark_change = markUpdator("change", function() return localmarks.change(bufnr) end)
 
@@ -224,10 +233,29 @@ function M.activate()
     arb:unlink()
   end
 
-  arbiter:repeats({ "WinEnter", "BufWinEnter" }, {
-    ---this vim.schedule is necessary here, due to: https://github.com/neovim/neovim/issues/24843
-    callback = vim.schedule_wrap(on_winenter),
-  })
+  do
+    --facts:
+    --* winenter is always triggered before bufwinenter
+    --* unless open_win(enter=false)
+    local last_winenter
+    arbiter:repeats("WinEnter", {
+      callback = function()
+        local winid = ni.get_current_win()
+        local bufnr = ni.get_current_buf()
+        last_winenter = winid
+        main(winid, bufnr)
+      end,
+    })
+    arbiter:repeats("BufWinEnter", {
+      callback = function()
+        local winid = ni.get_current_win()
+        --AFAIK, this must be open_win(enter=false)
+        if winid ~= last_winenter then return end
+        local bufnr = ni.get_current_buf()
+        main(winid, bufnr)
+      end,
+    })
+  end
 
   --triger the first run
   arbiter:emit("WinEnter", {})
