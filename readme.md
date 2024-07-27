@@ -9,7 +9,8 @@ https://github.com/user-attachments/assets/114490f9-6b05-497c-98e3-352dfaf4a576
 * only show them in the current/focused window/buffer at the same time
 
 ## status
-* WIP: it's harder than i thought
+* it just works
+* i found showing inline extmarks is just too distrubing
 
 ## todo
 * [ ] `g;`, `g,`
