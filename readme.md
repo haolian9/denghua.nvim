@@ -11,6 +11,7 @@ https://github.com/user-attachments/assets/114490f9-6b05-497c-98e3-352dfaf4a576
 ## status
 * it just works
 * i found showing inline extmarks is just too distrubing
+* due to [vim's design](https://github.com/neovim/neovim/issues/29820), i see no need to continue.
 
 ## todo
 * [ ] `g;`, `g,`
